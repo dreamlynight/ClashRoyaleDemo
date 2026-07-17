@@ -14,6 +14,7 @@ const PRESET_BUTTON_AREAS := [
 ]
 const MIN_LOADING_VISIBLE_SECONDS := 0.6
 const MAX_CONCURRENT_LOADS := 2
+const DEFAULT_WEB_SOCKET_URL := "wss://diamonds-neil-wise-prospects.trycloudflare.com"
 
 enum Page { LOBBY, DECK }
 enum OnlineChoice { SOLO, HOST, JOIN }
@@ -203,6 +204,9 @@ func _build_room_overlay() -> void:
 	_ip_input = LineEdit.new()
 	_ip_input.position = Vector2(32, 214)
 	_ip_input.size = Vector2(326, 39)
+	_ip_input.virtual_keyboard_enabled = true
+	_ip_input.virtual_keyboard_show_on_focus = true
+	_ip_input.virtual_keyboard_type = LineEdit.KEYBOARD_TYPE_URL
 	_ip_input.placeholder_text = "或输入主机 IP，例如 192.168.1.100"
 	_ip_input.visible = false
 	_ip_input.add_theme_stylebox_override("normal", _panel_style(Color("#0c2343"), 10, Color("#77cef8"), 2))
@@ -374,6 +378,7 @@ func _open_web_room() -> void:
 	_room_overlay.visible = true
 	_host_picker.visible = false
 	_ip_input.visible = true
+	_ip_input.text = DEFAULT_WEB_SOCKET_URL
 	_ip_input.placeholder_text = "wss://你的专服地址"
 	_room_action.text = "连接在线服务器"
 	_room_action.disabled = false
