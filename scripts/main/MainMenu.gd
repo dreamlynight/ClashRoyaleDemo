@@ -14,7 +14,7 @@ const PRESET_BUTTON_AREAS := [
 ]
 const MIN_LOADING_VISIBLE_SECONDS := 0.6
 const MAX_CONCURRENT_LOADS := 2
-const DEFAULT_WEB_SOCKET_URL := "wss://diamonds-neil-wise-prospects.trycloudflare.com"
+const DEFAULT_WEB_SOCKET_URL := "wss://suggestions-issues-unable-package.trycloudflare.com"
 
 enum Page { LOBBY, DECK }
 enum OnlineChoice { SOLO, HOST, JOIN }
