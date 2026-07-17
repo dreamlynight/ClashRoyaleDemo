@@ -112,10 +112,7 @@ func start_web_server(port: int = WEB_SERVER_PORT) -> Error:
 		return err
 	transport = Transport.WEB_SOCKET
 	_dedicated_web_server = true
-	_web_peer_order.clear()
-	_web_lobby_decks.clear()
-	_web_ready_peers.clear()
-	_web_match_started = false
+	_reset_dedicated_web_lobby()
 	multiplayer.multiplayer_peer = peer
 	state = State.HOSTING
 	print("[NetworkManager] WebSocket dedicated server listening on %d" % port)
@@ -223,6 +220,16 @@ func reset_battle_scene_readiness() -> void:
 	_remote_battle_scene_ready = false
 
 
+## A dedicated WebSocket match is single-use. Once a player leaves, discard all
+## peer IDs and lobby data so the next two browsers form a fresh match.
+func _reset_dedicated_web_lobby() -> void:
+	_web_peer_order.clear()
+	_web_lobby_decks.clear()
+	_web_ready_peers.clear()
+	_web_match_started = false
+	reset_battle_scene_readiness()
+
+
 ## 当前端已实例化 BattleScene 后调用。RPC 挂在 Autoload，远端仍在菜单/加载页也能安全接收。
 func announce_battle_scene_ready() -> void:
 	if _local_battle_scene_ready:
@@ -300,6 +307,14 @@ func _on_peer_disconnected(peer_id: int) -> void:
 	_web_peer_order.erase(peer_id)
 	_web_lobby_decks.erase(peer_id)
 	_web_ready_peers.erase(peer_id)
+	if is_dedicated_web_server():
+		# Do not let the remaining browser become a stale opponent for a later
+		# connection. A new match always starts with two newly connected players.
+		var remaining_peers: Array[int] = _web_peer_order.duplicate()
+		_reset_dedicated_web_lobby()
+		state = State.HOSTING
+		for remaining_peer in remaining_peers:
+			multiplayer.multiplayer_peer.disconnect_peer(remaining_peer)
 	peer_disconnected.emit(peer_id)
 
 
