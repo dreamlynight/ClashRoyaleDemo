@@ -126,7 +126,7 @@ func _setup_towers() -> void:
 			if BattleConstants.TOWER_PIXEL_POSITIONS.has(child.name):
 				var tower_pos: Vector2 = BattleConstants.TOWER_PIXEL_POSITIONS[child.name]
 				# Client 端塔位置镜像 + team 翻转（自己的塔在下方且为蓝方）
-				if is_network_mode and not is_host:
+				if is_network_mode and NetworkManager.should_mirror_view():
 					tower_pos = BattleConstants.mirror(tower_pos)
 					team_name = "enemy" if team_name == "player" else "player"
 				child.position = tower_pos
@@ -225,7 +225,7 @@ func _queue_remaining_deck_art() -> void:
 	if enemy_order.is_empty():
 		enemy_order = Game.get_remote_deck() if is_network_mode else DataRegistry.get_default_enemy_deck()
 	# Client 的本地画面以自己为蓝方，和加载页采用相同的阵营换位。
-	if NetworkManager.is_networked_client():
+	if NetworkManager.should_mirror_view():
 		var host_order := player_order
 		player_order = enemy_order
 		enemy_order = host_order
@@ -724,7 +724,7 @@ func _unhandled_input(event: InputEvent) -> void:
 			# 精英技能瞄准中：点击战场释放 targeted 技能
 			if battle_running and selected_skill_unit != null:
 				var skill_pos: Vector2 = world.get_local_mouse_position()
-				if is_network_mode and not is_host:
+				if is_network_mode and NetworkManager.should_mirror_view():
 					skill_pos = BattleConstants.mirror(skill_pos)
 				if is_instance_valid(selected_skill_unit) and not selected_skill_unit.is_dead:
 					_cast_elite_skill(selected_skill_unit, selected_skill_unit.elite_skill_data, skill_pos)
@@ -741,7 +741,7 @@ func _unhandled_input(event: InputEvent) -> void:
 				# 吸附到最近合法格中心（出界/贴近建筑时自动锁定）
 				# Client 端画面是 180 度镜像的：鼠标视觉坐标需逆镜像回逻辑坐标再做部署判定
 				var raw_pos: Vector2 = world.get_local_mouse_position()
-				if is_network_mode and not is_host:
+				if is_network_mode and NetworkManager.should_mirror_view():
 					raw_pos = BattleConstants.mirror(raw_pos)
 				var world_pos: Vector2 = arena.find_nearest_valid_deploy(
 					raw_pos, is_spell, local_team)
@@ -758,11 +758,20 @@ func _unhandled_input(event: InputEvent) -> void:
 func _on_remote_battle_scene_ready() -> void:
 	if not is_network_mode or not is_host or _client_ready:
 		return
+	if NetworkManager.is_dedicated_web_server() and not NetworkManager.all_web_clients_ready():
+		return
 	_client_ready = true
 	print("[BattleManager] client 战斗场景已就绪，开始同步状态")
 	# 立即同步一次完整状态和可靠手牌；此时 Client 的 BattleManager 已存在，RPC 不会丢包。
 	_sync_state_to_client()
-	if _remote_deck:
+	if NetworkManager.is_dedicated_web_server():
+		var player_peer := NetworkManager.web_player_peer("player")
+		var enemy_peer := NetworkManager.web_player_peer("enemy")
+		if player_peer > 0:
+			_rpc_sync_hand.rpc_id(player_peer, deck_manager.get_hand(), deck_manager.get_next())
+		if enemy_peer > 0 and _remote_deck:
+			_rpc_sync_hand.rpc_id(enemy_peer, _remote_deck.get_hand(), _remote_deck.get_next())
+	elif _remote_deck:
 		_rpc_sync_hand.rpc(_remote_deck.get_hand(), _remote_deck.get_next())
 
 
@@ -771,22 +780,28 @@ func _on_remote_battle_scene_ready() -> void:
 func _rpc_play_card(hand_index: int, team: String, world_position: Vector2) -> void:
 	if not is_host:
 		return
-	# 远程玩家的 team 应为 enemy（与 host 的 remote_team 一致）
-	if team != NetworkManager.remote_team():
-		team = NetworkManager.remote_team()
-	# 查找远程玩家手牌
-	if _remote_deck == null:
+	if NetworkManager.is_dedicated_web_server() and not _client_ready:
 		return
-	var hand = _remote_deck.get_hand()
+	var source_peer := multiplayer.get_remote_sender_id()
+	var source_deck: DeckManager = _remote_deck
+	if NetworkManager.is_dedicated_web_server():
+		team = NetworkManager.web_team_for_peer(source_peer)
+		source_deck = deck_manager if team == "player" else _remote_deck
+	elif team != NetworkManager.remote_team():
+		team = NetworkManager.remote_team()
+	if source_deck == null:
+		return
+	var hand = source_deck.get_hand()
 	if hand_index < 0 or hand_index >= hand.size():
 		return
 	var card_id = hand[hand_index]
 	var success = try_play_card(card_id, team, world_position)
 	if success:
-		# 轮转远程玩家手牌
-		_remote_deck.play_card(hand_index)
-		# 同步新手牌给 client
-		_rpc_sync_hand.rpc(_remote_deck.get_hand(), _remote_deck.get_next())
+		source_deck.play_card(hand_index)
+		if NetworkManager.is_dedicated_web_server():
+			_rpc_sync_hand.rpc_id(source_peer, source_deck.get_hand(), source_deck.get_next())
+		else:
+			_rpc_sync_hand.rpc(_remote_deck.get_hand(), _remote_deck.get_next())
 		print("[BattleManager] 远程玩家出牌:", card_id)
 
 
@@ -810,11 +825,18 @@ func _rpc_sync_state(p_energy: int, e_energy: int, p_progress: float, e_progress
 		SignalBus.battle_phase_changed.emit(phase_val, overtime_duration if phase_val == "overtime" else max_battle_time)
 	_set_elixir_multiplier(multiplier_val)
 	# Client 视角翻转：自己(player)=host 的 enemy；敌方(enemy)=host 的 player
-	_player_state.energy = e_energy
-	_enemy_state.energy = p_energy
-	SignalBus.energy_changed.emit("player", e_energy, max_energy)
-	SignalBus.energy_changed.emit("enemy", p_energy, max_energy)
-	SignalBus.player_energy_progress = e_progress
+	var local_energy := p_energy
+	var opponent_energy := e_energy
+	var local_progress := p_progress
+	if NetworkManager.should_mirror_view():
+		local_energy = e_energy
+		opponent_energy = p_energy
+		local_progress = e_progress
+	_player_state.energy = local_energy
+	_enemy_state.energy = opponent_energy
+	SignalBus.energy_changed.emit("player", local_energy, max_energy)
+	SignalBus.energy_changed.emit("enemy", opponent_energy, max_energy)
+	SignalBus.player_energy_progress = local_progress
 	# 更新时间
 	battle_time = time_val
 	# 阶段切换
@@ -823,7 +845,7 @@ func _rpc_sync_state(p_energy: int, e_energy: int, p_progress: float, e_progress
 		if phase_val == "overtime":
 			SignalBus.battle_phase_changed.emit("overtime", overtime_duration)
 	# 更新圣水条进度（client 自己 = host 的 enemy）
-	_player_state.energy_progress = e_progress
+	_player_state.energy_progress = local_progress
 
 
 ## Host → Client：战斗结束
@@ -833,10 +855,11 @@ func _rpc_battle_end(result: String) -> void:
 		return
 	# Host 发送的是主机视角的结果；Client 的本地 player 是主机的 enemy。
 	var local_result := result
-	if result == "victory":
-		local_result = "defeat"
-	elif result == "defeat":
-		local_result = "victory"
+	if NetworkManager.should_mirror_view():
+		if result == "victory":
+			local_result = "defeat"
+		elif result == "defeat":
+			local_result = "victory"
 	end_battle(local_result)
 
 
@@ -894,7 +917,9 @@ func _rpc_sync_beams(states: Array) -> void:
 		var unit_name: String = s[0]
 		var active: bool = s[1]
 		# 光束目标位置镜像（与单位/塔位置镜像一致）
-		var target_pos := BattleConstants.mirror(Vector2(s[2], s[3]))
+		var target_pos := Vector2(s[2], s[3])
+		if NetworkManager.should_mirror_view():
+			target_pos = BattleConstants.mirror(target_pos)
 		var stage: int = s[4]
 		var altitude: float = s[5]
 		var unit = units_root.get_node_or_null(unit_name)
@@ -920,7 +945,9 @@ func _rpc_sync_units(states: Array) -> void:
 				continue
 			_sync_node_cache[unit_name] = unit
 		# 镜像位置（180 度旋转，让 client 看到自己的塔在下方）
-		var mirrored_pos := BattleConstants.mirror(Vector2(s[1], s[2]))
+		var mirrored_pos := Vector2(s[1], s[2])
+		if NetworkManager.should_mirror_view():
+			mirrored_pos = BattleConstants.mirror(mirrored_pos)
 		# 单位用插值目标位置（_process 里 lerp 平滑过渡，消除卡顿）；
 		# 塔静止不动，直接设 position。
 		if unit is UnitBase:

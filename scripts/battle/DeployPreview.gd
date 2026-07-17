@@ -158,8 +158,8 @@ func _process(_delta: float) -> void:
 	# Client 端画面 180 度镜像：视觉坐标先逆镜像成逻辑坐标做部署校验，
 	# 再镜像回视觉坐标显示，让预览出现在玩家点击的屏幕位置。
 	var raw_pos := get_local_mouse_position()
-	var team: String = "enemy" if NetworkManager.is_networked_client() else "player"
-	if NetworkManager.is_networked_client():
+	var team: String = NetworkManager.local_team() if NetworkManager.is_networked() else "player"
+	if NetworkManager.should_mirror_view():
 		var logic_pos := BattleConstants.mirror(raw_pos)
 		var logic_snapped: Vector2 = _arena.find_nearest_valid_deploy(logic_pos, _is_spell, team)
 		_snapped_pos = BattleConstants.mirror(logic_snapped)

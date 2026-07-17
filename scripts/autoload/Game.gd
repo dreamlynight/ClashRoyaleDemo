@@ -114,6 +114,15 @@ func set_prepared_battle_decks(player_order: Array, enemy_order: Array) -> void:
 	prepared_enemy_deck_order = enemy_order.duplicate()
 
 
+## 专用联机服务器在两名玩家提交卡组后调用。
+## 服务器和两个 Web 客户端都会收到同一份已洗牌的牌序，避免各端自行 shuffle 导致不同步。
+func configure_dedicated_network_match(player_order: Array, enemy_order: Array, mode: int) -> void:
+	set_network_mode(true)
+	set_match_mode(mode)
+	set_remote_deck(enemy_order)
+	set_prepared_battle_decks(player_order, enemy_order)
+
+
 func get_prepared_player_deck() -> Array:
 	return prepared_player_deck_order.duplicate()
 

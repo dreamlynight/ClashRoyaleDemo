@@ -24,6 +24,18 @@ const DISCOVERY_MAGIC: String = "PLB_HOST"  ## 广播包标识（PixelLaneBattle
 enum State { OFFLINE, HOSTING, CONNECTING, CONNECTED }
 var state: State = State.OFFLINE
 
+## ENet is used by native LAN builds. Web exports connect to this dedicated
+## WebSocket server instead, because browsers cannot open UDP/ENet listeners.
+enum Transport { ENET_LAN, WEB_SOCKET }
+const WEB_SERVER_PORT: int = 7002
+var transport: Transport = Transport.ENET_LAN
+var _dedicated_web_server: bool = false
+var _web_local_team: String = "enemy"
+var _web_peer_order: Array[int] = []
+var _web_lobby_decks: Dictionary = {}
+var _web_ready_peers: Dictionary = {}
+var _web_match_started: bool = false
+
 # ---- 对外信号 ----
 ## Client 成功连上 Host（双方都收到）
 signal connected_to_server
@@ -41,6 +53,10 @@ signal discovery_started
 signal discovery_stopped
 ## 远端已实例化战斗场景。该握手运行在常驻 Autoload 上，避免场景切换期间 RPC 找不到 BattleManager。
 signal remote_battle_scene_ready
+## Emitted on browser clients after the dedicated server has paired two players.
+signal web_match_ready(player_order: Array, enemy_order: Array, local_team: String, mode: int)
+## Emitted by the dedicated server once it has accepted two valid decks.
+signal web_server_match_started
 
 var _local_battle_scene_ready: bool = false
 var _remote_battle_scene_ready: bool = false
@@ -84,6 +100,82 @@ func join_game(ip: String) -> Error:
 	return OK
 
 
+## Starts a native Godot process as the authority for Web clients.
+## Run with: Godot --headless --path . -- --web-server
+## A reverse proxy/tunnel must terminate TLS and expose this as wss:// to browsers.
+func start_web_server(port: int = WEB_SERVER_PORT) -> Error:
+	leave()
+	var peer := WebSocketMultiplayerPeer.new()
+	var err := peer.create_server(port)
+	if err != OK:
+		push_error("[NetworkManager] WebSocket server failed: %d" % err)
+		return err
+	transport = Transport.WEB_SOCKET
+	_dedicated_web_server = true
+	_web_peer_order.clear()
+	_web_lobby_decks.clear()
+	_web_ready_peers.clear()
+	_web_match_started = false
+	multiplayer.multiplayer_peer = peer
+	state = State.HOSTING
+	print("[NetworkManager] WebSocket dedicated server listening on %d" % port)
+	return OK
+
+
+## Browser clients call this with a public wss:// URL, normally a Cloudflare
+## Tunnel URL that forwards to the local dedicated server's port 7002.
+func join_web_game(url: String) -> Error:
+	if not (url.begins_with("ws://") or url.begins_with("wss://")):
+		return ERR_INVALID_PARAMETER
+	leave()
+	var peer := WebSocketMultiplayerPeer.new()
+	var err := peer.create_client(url)
+	if err != OK:
+		push_error("[NetworkManager] WebSocket client failed: %d" % err)
+		return err
+	transport = Transport.WEB_SOCKET
+	_dedicated_web_server = false
+	multiplayer.multiplayer_peer = peer
+	state = State.CONNECTING
+	print("[NetworkManager] connecting to WebSocket server %s" % url)
+	return OK
+
+
+func is_web_transport() -> bool:
+	return transport == Transport.WEB_SOCKET
+
+
+func is_dedicated_web_server() -> bool:
+	return _dedicated_web_server and is_server()
+
+
+func should_mirror_view() -> bool:
+	return is_networked() and not is_server() and local_team() == "enemy"
+
+
+func web_team_for_peer(peer_id: int) -> String:
+	if _web_peer_order.size() > 0 and peer_id == _web_peer_order[0]:
+		return "player"
+	return "enemy"
+
+
+func web_player_peer(team_name: String) -> int:
+	if team_name == "player" and _web_peer_order.size() > 0:
+		return _web_peer_order[0]
+	if team_name == "enemy" and _web_peer_order.size() > 1:
+		return _web_peer_order[1]
+	return 0
+
+
+func all_web_clients_ready() -> bool:
+	return is_dedicated_web_server() and _web_peer_order.size() == MAX_CLIENTS and _web_ready_peers.size() == MAX_CLIENTS
+
+
+func submit_web_lobby_deck(cards: Array, mode: int) -> void:
+	if is_web_transport() and is_client():
+		_rpc_submit_web_lobby_deck.rpc_id(1, cards, mode)
+
+
 ## 断开连接，回到离线状态
 func leave() -> void:
 	_stop_discovery()
@@ -116,11 +208,13 @@ func is_networked_client() -> bool:
 
 ## 本地玩家在游戏中的阵营。Host = "player"，Client = "enemy"
 func local_team() -> String:
-	return "player" if is_server() else "enemy"
+	if is_server():
+		return "player"
+	return _web_local_team if is_web_transport() else "enemy"
 
 ## 远程玩家的阵营
 func remote_team() -> String:
-	return "enemy" if is_server() else "player"
+	return "enemy" if local_team() == "player" else "player"
 
 
 ## 新的一局开始加载时清空场景握手状态。双方各自在进入加载页前调用。
@@ -134,18 +228,31 @@ func announce_battle_scene_ready() -> void:
 	if _local_battle_scene_ready:
 		return
 	_local_battle_scene_ready = true
-	if is_networked():
-		_rpc_battle_scene_ready.rpc()
+	if is_networked() and not is_server():
+		_rpc_battle_scene_ready.rpc_id(1)
 
 
 func is_remote_battle_scene_ready() -> bool:
+	# Web clients only need their own scene ready; the dedicated server waits for
+	# both clients before it begins simulation.
+	if is_web_transport() and is_client():
+		return _local_battle_scene_ready
 	return _remote_battle_scene_ready
 
 
 ## 接收远端的战斗场景就绪通知。不能放在 BattleManager：其中一端加载较慢时该节点尚不存在。
 @rpc("any_peer", "call_remote", "reliable")
 func _rpc_battle_scene_ready() -> void:
-	if not is_networked() or _remote_battle_scene_ready:
+	if not is_networked():
+		return
+	if is_dedicated_web_server():
+		var peer_id := multiplayer.get_remote_sender_id()
+		_web_ready_peers[peer_id] = true
+		if all_web_clients_ready() and not _remote_battle_scene_ready:
+			_remote_battle_scene_ready = true
+			remote_battle_scene_ready.emit()
+		return
+	if _remote_battle_scene_ready:
 		return
 	_remote_battle_scene_ready = true
 	remote_battle_scene_ready.emit()
@@ -167,10 +274,18 @@ func _ready() -> void:
 	multiplayer.connected_to_server.connect(_on_connected_to_server)
 	multiplayer.connection_failed.connect(_on_connection_failed)
 	multiplayer.server_disconnected.connect(_on_server_disconnected)
+	if "--web-server" in OS.get_cmdline_user_args():
+		start_web_server()
 
 
 func _on_peer_connected(peer_id: int) -> void:
 	print("[NetworkManager] peer connected: %d" % peer_id)
+	if is_dedicated_web_server():
+		if peer_id not in _web_peer_order and _web_peer_order.size() < MAX_CLIENTS:
+			_web_peer_order.append(peer_id)
+		else:
+			multiplayer.multiplayer_peer.disconnect_peer(peer_id)
+			return
 	# Host 收到 client 连入 → 进入 CONNECTED 状态
 	if state == State.HOSTING:
 		state = State.CONNECTED
@@ -182,6 +297,9 @@ func _on_peer_connected(peer_id: int) -> void:
 
 func _on_peer_disconnected(peer_id: int) -> void:
 	print("[NetworkManager] peer disconnected: %d" % peer_id)
+	_web_peer_order.erase(peer_id)
+	_web_lobby_decks.erase(peer_id)
+	_web_ready_peers.erase(peer_id)
 	peer_disconnected.emit(peer_id)
 
 
@@ -203,6 +321,50 @@ func _on_server_disconnected() -> void:
 	print("[NetworkManager] 服务器断开")
 	state = State.OFFLINE
 	server_disconnected.emit()
+
+
+@rpc("any_peer", "call_remote", "reliable")
+func _rpc_submit_web_lobby_deck(cards: Array, mode: int) -> void:
+	if not is_dedicated_web_server() or _web_match_started:
+		return
+	var peer_id := multiplayer.get_remote_sender_id()
+	if peer_id not in _web_peer_order:
+		return
+	var validated: Array = []
+	for card_id in cards:
+		if card_id is String and not DataRegistry.get_card_data(card_id).is_empty():
+			validated.append(card_id)
+	if validated.size() < 5:
+		return
+	_web_lobby_decks[peer_id] = validated
+	if _web_peer_order.size() != MAX_CLIENTS or _web_lobby_decks.size() != MAX_CLIENTS:
+		return
+	var player_peer := _web_peer_order[0]
+	var enemy_peer := _web_peer_order[1]
+	var player_order: Array = _web_lobby_decks[player_peer].duplicate()
+	var enemy_order: Array = _web_lobby_decks[enemy_peer].duplicate()
+	player_order.shuffle()
+	enemy_order.shuffle()
+	_web_match_started = true
+	_rpc_web_match_ready.rpc_id(player_peer, player_order, enemy_order, "player", mode)
+	_rpc_web_match_ready.rpc_id(enemy_peer, player_order, enemy_order, "enemy", mode)
+	Game.configure_dedicated_network_match(player_order, enemy_order, mode)
+	web_server_match_started.emit()
+	call_deferred("_start_dedicated_web_match")
+
+
+@rpc("authority", "call_remote", "reliable")
+func _rpc_web_match_ready(player_order: Array, enemy_order: Array, assigned_team: String, mode: int) -> void:
+	if is_server():
+		return
+	_web_local_team = assigned_team
+	Game.configure_dedicated_network_match(player_order, enemy_order, mode)
+	web_match_ready.emit(player_order, enemy_order, assigned_team, mode)
+
+
+func _start_dedicated_web_match() -> void:
+	if is_dedicated_web_server():
+		Game.start_battle()
 
 
 # ==============================================================================

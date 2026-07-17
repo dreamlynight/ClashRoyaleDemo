@@ -73,6 +73,7 @@ func _ready() -> void:
 	NetworkManager.connection_failed.connect(_on_connection_failed)
 	NetworkManager.server_disconnected.connect(_on_server_disconnected)
 	NetworkManager.host_discovered.connect(_on_host_discovered)
+	NetworkManager.web_match_ready.connect(_on_web_match_ready)
 
 
 func _build_base() -> void:
@@ -331,6 +332,9 @@ func _apply_settings() -> void:
 
 
 func _open_host_room() -> void:
+	if OS.has_feature("web"):
+		_open_web_room()
+		return
 	Game.set_match_mode(_mode_select.get_selected_id())
 	Game.set_network_mode(true)
 	Game.set_remote_deck([])
@@ -348,6 +352,9 @@ func _open_host_room() -> void:
 
 
 func _open_join_room() -> void:
+	if OS.has_feature("web"):
+		_open_web_room()
+		return
 	_room_mode = OnlineChoice.JOIN
 	_room_overlay.visible = true
 	_host_picker.visible = true
@@ -362,10 +369,34 @@ func _open_join_room() -> void:
 	NetworkManager.start_scanning()
 
 
+func _open_web_room() -> void:
+	_room_mode = OnlineChoice.JOIN
+	_room_overlay.visible = true
+	_host_picker.visible = false
+	_ip_input.visible = true
+	_ip_input.placeholder_text = "wss://你的专服地址"
+	_room_action.text = "连接在线服务器"
+	_room_action.disabled = false
+	_room_status.text = "网页版需要连接专用服务器。两名玩家填入同一个 wss:// 地址后会自动配对。"
+
+
 func _on_room_action() -> void:
 	if _room_mode != OnlineChoice.JOIN:
 		return
 	var ip := _ip_input.text.strip_edges()
+	if OS.has_feature("web"):
+		if ip.is_empty():
+			_room_status.text = "请输入 WebSocket 服务器地址（wss://...）。"
+			return
+		Game.set_match_mode(_mode_select.get_selected_id())
+		Game.set_network_mode(true)
+		if NetworkManager.join_web_game(ip) != OK:
+			Game.set_network_mode(false)
+			_room_status.text = "无法连接在线服务器，请检查 wss:// 地址。"
+			return
+		_room_status.text = "正在连接在线服务器…"
+		_room_action.disabled = true
+		return
 	if ip.is_empty() and not _found_hosts.is_empty():
 		ip = _found_hosts[0]
 	if ip.is_empty():
@@ -405,11 +436,22 @@ func _on_host_discovered(ip: String) -> void:
 
 func _on_connected() -> void:
 	NetworkManager.stop_scanning()
+	if NetworkManager.is_web_transport() and not NetworkManager.is_server():
+		NetworkManager.submit_web_lobby_deck(Game.get_selected_deck(), _mode_select.get_selected_id())
+		_room_status.text = "已连接，正在等待另一名玩家加入…"
+		return
 	if NetworkManager.is_client():
 		_rpc_submit_lobby_deck.rpc_id(1, Game.get_selected_deck())
 		_room_status.text = "已连接，正在等待主机锁定本局牌序…"
 	elif NetworkManager.is_server():
 		_room_status.text = "对手已连接，正在同步双方卡组…"
+
+
+func _on_web_match_ready(_player_order: Array, _enemy_order: Array, _team: String, _mode: int) -> void:
+	if not _room_overlay.visible:
+		return
+	_room_status.text = "匹配成功，正在加载战斗…"
+	_begin_loading()
 
 
 func _on_connection_failed() -> void:
